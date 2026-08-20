@@ -21,6 +21,13 @@
 /** delay in us for eeprom ready loop */
 #define EC_LOCALDELAY 200
 
+/** Mailbox response diagnostics - keep in step with the same define in ec_coe.c.
+ * Set both to 0 to compile the instrumentation out. */
+#define EC_MBX_DIAG (0)
+#if EC_MBX_DIAG
+#include <stdio.h>
+#endif
+
 /** record for ethercat eeprom communications */
 OSAL_PACKED_BEGIN
 typedef struct OSAL_PACKED
@@ -1702,6 +1709,34 @@ int ecx_mbxreceive(ecx_contextt *context, uint16 slave, ec_mbxbuft **mbx, int ti
                }
                else
                {
+#if EC_MBX_DIAG
+                  /* A master can never legitimately receive a CoE SDO *request* (service
+                   * 0x02) - that is a frame we sent.  Getting one back means this read
+                   * returned write-mailbox content.  Report the FPRD result and the offset
+                   * actually read, neither of which is visible to the CoE layer above. */
+                  if ((etohs(EMp->CANOpen) >> 12) == 0x02)
+                  {
+                     const uint8 *raw = (const uint8 *)mbxin;
+                     /* Re-read the sync managers now, at the instant of the anomaly.  The
+                      * startup dump only shows static config; this catches SM1 being
+                      * reconfigured or its status disagreeing with what we polled. */
+                     uint8 sm[16];
+                     int smwkc = ecx_FPRD(&context->port, configadr, ECT_REG_SM0, sizeof(sm), sm, EC_TIMEOUTRET3);
+                     printf("MBXDIAG recv-req  slave:%d fprd_wkc:%d read ro:0x%04x rl:%d "
+                            "(wo:0x%04x l:%d) cmd:0x%02x idx:%02x%02x.%02x | SM(wkc:%d) "
+                            "SM0 start:0x%04x len:%d ctl:0x%02x stat:0x%02x act:0x%02x | "
+                            "SM1 start:0x%04x len:%d ctl:0x%02x stat:0x%02x act:0x%02x\n",
+                            slave, wkc, (unsigned)mbxro, (int)mbxl,
+                            (unsigned)slavelist->mbx_wo, (int)slavelist->mbx_l,
+                            (unsigned)raw[8], (unsigned)raw[10], (unsigned)raw[9], (unsigned)raw[11],
+                            smwkc,
+                            (unsigned)(sm[0] | (sm[1] << 8)), (int)(sm[2] | (sm[3] << 8)),
+                            (unsigned)sm[4], (unsigned)sm[5], (unsigned)sm[6],
+                            (unsigned)(sm[8] | (sm[9] << 8)), (int)(sm[10] | (sm[11] << 8)),
+                            (unsigned)sm[12], (unsigned)sm[13], (unsigned)sm[14]);
+                     fflush(stdout);
+                  }
+#endif
                   *mbx = mbxin;
                   mbxin = NULL;
                }

@@ -34,6 +34,55 @@ typedef struct OSAL_PACKED
 } ec_SDOt;
 OSAL_PACKED_END
 
+/** Mailbox response diagnostics.
+ *
+ * Reports SDO responses that do not correspond to the request that was just sent, to
+ * distinguish a stale/off-by-one mailbox response from outright corruption.  The
+ * decisive field is the mailbox counter: an EtherCAT slave echoes the counter of the
+ * request it is answering, so a response carrying the *previous* request's counter
+ * means the mailbox is one transaction behind rather than returning garbage.
+ *
+ * Set to 0 to compile out.  Kept separate from EC_PRINT/EC_DEBUG so this can be left
+ * on without the rest of the SOEM debug output.
+ */
+#define EC_MBX_DIAG (0)
+
+#if EC_MBX_DIAG
+#include <stdio.h>
+static void ecx_mbxdiag(const char *what, ecx_contextt *context, uint16 slave,
+                        uint16 index, uint8 subindex, const ec_SDOt *aSDOp)
+{
+   printf("MBXDIAG %-10s slave:%d req:%04x.%02x sent_cnt:%d | got proto:0x%02x cnt:%d "
+          "svc:0x%x cmd:0x%02x idx:%04x.%02x mbxlen:%d | mbx wo:0x%04x l:%d ro:0x%04x rl:%d "
+          "pool:%d/%d%s\n",
+          what, slave, index, subindex, context->slavelist[slave].mbx_cnt,
+          (unsigned)(aSDOp->MbxHeader.mbxtype & 0x0f),
+          (unsigned)((aSDOp->MbxHeader.mbxtype >> 4) & 0x07),
+          (unsigned)(etohs(aSDOp->CANOpen) >> 12),
+          (unsigned)aSDOp->Command,
+          (unsigned)etohs(aSDOp->Index), (unsigned)aSDOp->SubIndex,
+          (int)etohs(aSDOp->MbxHeader.length),
+          (unsigned)context->slavelist[slave].mbx_wo,
+          (int)context->slavelist[slave].mbx_l,
+          (unsigned)context->slavelist[slave].mbx_ro,
+          (int)context->slavelist[slave].mbx_rl,
+          /* Free buffers left in the mailbox pool.  ecx_mbxsend() drops the request buffer
+           * back before ecx_mbxreceive() takes one for the response, so if the pool has
+           * drained to almost nothing the response buffer handed out is the very buffer
+           * that still holds the request we just sent.  Read without the mutex - this is
+           * diagnostic only. */
+          context->mbxpool.listcount, EC_MBXPOOLSIZE,
+          (context->slavelist[slave].mbx_ro == context->slavelist[slave].mbx_wo) ? "  *** ro==wo ***" : "");
+   fflush(stdout);
+}
+#define EC_MBX_DIAG_REPORT(what, ctx, sl, ix, sx, resp) ecx_mbxdiag(what, ctx, sl, ix, sx, resp)
+#else
+#define EC_MBX_DIAG_REPORT(what, ctx, sl, ix, sx, resp) \
+   do                                                   \
+   {                                                    \
+   } while (0)
+#endif
+
 /** SDO service structure */
 OSAL_PACKED_BEGIN
 typedef struct OSAL_PACKED
@@ -97,25 +146,15 @@ static void ecx_SDOinfoerror(ecx_contextt *context, uint16 Slave, uint16 Index, 
    ecx_pusherror(context, &Ec);
 }
 
-/** CoE SDO read, blocking. Single subindex or Complete Access.
+/** One attempt at a CoE SDO read. See ecx_SDOread() for the parameters.
  *
- * Only a "normal" upload request is issued. If the requested parameter is <= 4bytes
- * then a "expedited" response is returned, otherwise a "normal" response. If a "normal"
- * response is larger than the mailbox size then the response is segmented. The function
- * will combine all segments and copy them to the parameter buffer.
- *
- * @param[in]  context    context struct
- * @param[in]  slave      Slave number
- * @param[in]  index      Index to read
- * @param[in]  subindex   Subindex to read, must be 0 or 1 if CA is used.
- * @param[in]  CA         FALSE = single subindex. TRUE = Complete Access, all subindexes read.
- * @param[in,out] psize   Size in bytes of parameter buffer, returns bytes read from SDO.
- * @param[out] p          Pointer to parameter buffer
- * @param[in]  timeout    Timeout in us, standard is EC_TIMEOUTRXM
- * @return Workcounter from last slave response
+ * @param[out] mismatch   Set when the failure was a response that did not correspond to
+ *                        the request, as opposed to a timeout or an SDO abort.  Only that
+ *                        case is worth re-issuing; an abort is a legitimate answer and a
+ *                        retry would just cost time.
  */
-int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subindex,
-                boolean CA, int *psize, void *p, int timeout)
+static int ecx_SDOread_once(ecx_contextt *context, uint16 slave, uint16 index, uint8 subindex,
+                            boolean CA, int *psize, void *p, int timeout, int *mismatch)
 {
    ec_SDOt *SDOp, *aSDOp;
    uint16 bytesize, Framedatasize;
@@ -127,9 +166,16 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
    uint8 cnt, toggle;
    boolean NotLast;
 
+   *mismatch = 0;
    MbxIn = NULL;
    MbxOut = NULL;
    wkc = ecx_mbxreceive(context, slave, &MbxIn, 0);
+   /* A frame already waiting before we have sent anything is a leftover from an earlier
+    * transaction - the mailbox is behind.  Normally dropped without a trace below. */
+   if ((wkc > 0) && MbxIn)
+   {
+      EC_MBX_DIAG_REPORT("stale-pre", context, slave, index, subindex, (const ec_SDOt *)MbxIn);
+   }
    MbxOut = ecx_getmbx(context);
    if (!MbxOut) return wkc;
    ec_clearmbx(MbxOut);
@@ -177,6 +223,16 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
              ((etohs(aSDOp->CANOpen) >> 12) == ECT_COES_SDORES) &&
              (aSDOp->Index == SDOp->Index))
          {
+            /* The index is checked above but the subindex is not, so a response carrying
+             * a different subindex of the same object is accepted here and its payload
+             * used as if it belonged to the requested one - silently, with no wkc error.
+             * ecx_readPDOmap() walks 0x1A00:1,:2,:3... all under one index, so that is
+             * exactly where an off-by-one mailbox would corrupt a bit length rather than
+             * raise one. Report it; do not change the accept/reject behaviour here. */
+            if (aSDOp->SubIndex != subindex)
+            {
+               EC_MBX_DIAG_REPORT("subidx", context, slave, index, subindex, aSDOp);
+            }
             if ((aSDOp->Command & 0x02) > 0)
             {
                /* expedited frame response */
@@ -279,7 +335,11 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
                                  if ((aSDOp->Command) == ECT_SDO_ABORT) /* SDO abort frame received */
                                     ecx_SDOerror(context, slave, index, subindex, etohl(aSDOp->ldata[0]));
                                  else
+                                 {
+                                    EC_MBX_DIAG_REPORT("segment", context, slave, index, subindex, aSDOp);
                                     ecx_packeterror(context, slave, index, subindex, 1); /* Unexpected frame returned */
+                                    *mismatch = 1;
+                                 }
                                  wkc = 0;
                               }
                            }
@@ -312,7 +372,9 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
             }
             else
             {
+               EC_MBX_DIAG_REPORT("response", context, slave, index, subindex, aSDOp);
                ecx_packeterror(context, slave, index, subindex, 1); /* Unexpected frame returned */
+               *mismatch = 1;
             }
             wkc = 0;
          }
@@ -320,6 +382,58 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
    }
    if (MbxIn) ecx_dropmbx(context, MbxIn);
    if (MbxOut) ecx_dropmbx(context, MbxOut);
+   return wkc;
+}
+
+/** Attempts at an SDO upload before giving up, when the slave's response does not
+ * correspond to the request that was sent. */
+#define EC_SDO_READ_RETRY (3)
+
+/** CoE SDO read, blocking. Single subindex or Complete Access.
+ *
+ * Only a "normal" upload request is issued. If the requested parameter is <= 4bytes
+ * then a "expedited" response is returned, otherwise a "normal" response. If a "normal"
+ * response is larger than the mailbox size then the response is segmented. The function
+ * will combine all segments and copy them to the parameter buffer.
+ *
+ * The mailbox full flag is polled in one datagram and the mailbox read in the next, so
+ * the mailbox can be emptied in between - by the repeat request handling in
+ * ecx_mbxreceive(), or by the slave itself.  The read then returns whatever the ESC
+ * still held in that memory, which is detected below as a response that does not
+ * correspond to the request.  Re-issue the upload rather than reporting a failure the
+ * callers do not retry: ecx_readPDOmap() in particular just skips the entry, which
+ * silently shortens the reported PDO size.
+ *
+ * @param[in]  context    context struct
+ * @param[in]  slave      Slave number
+ * @param[in]  index      Index to read
+ * @param[in]  subindex   Subindex to read, must be 0 or 1 if CA is used.
+ * @param[in]  CA         FALSE = single subindex. TRUE = Complete Access, all subindexes read.
+ * @param[in,out] psize   Size in bytes of parameter buffer, returns bytes read from SDO.
+ * @param[out] p          Pointer to parameter buffer
+ * @param[in]  timeout    Timeout in us, standard is EC_TIMEOUTRXM
+ * @return Workcounter from last slave response
+ */
+int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subindex,
+                boolean CA, int *psize, void *p, int timeout)
+{
+   int wkc;
+   int attempt;
+   int mismatch = 0;
+   /* psize is in/out - it carries the buffer size in and the bytes read out, so it has
+    * to be restored before each further attempt. */
+   const int psize_in = *psize;
+
+   for (attempt = 0;;)
+   {
+      wkc = ecx_SDOread_once(context, slave, index, subindex, CA, psize, p, timeout, &mismatch);
+      if ((wkc > 0) || !mismatch || (++attempt >= EC_SDO_READ_RETRY))
+      {
+         break;
+      }
+      *psize = psize_in;
+   }
+
    return wkc;
 }
 
